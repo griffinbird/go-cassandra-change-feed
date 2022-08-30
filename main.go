@@ -1,65 +1,99 @@
 package main
 
 import (
+	"crypto/tls"
 	"log"
-	"math/rand"
 	"os"
-	"strconv"
+	"sync"
 	"time"
 
-	"github.com/Azure-Samples/azure-cosmos-db-cassandra-go-getting-started/model"
-	"github.com/Azure-Samples/azure-cosmos-db-cassandra-go-getting-started/operations"
-	"github.com/Azure-Samples/azure-cosmos-db-cassandra-go-getting-started/utils"
-)
+	"github.com/griffinbird/go-cassandra-cf/changefeed"
+	"github.com/griffinbird/go-cassandra-cf/inserter"
+	"github.com/griffinbird/go-cassandra-cf/setup"
 
-var (
-	cosmosCassandraContactPoint string
-	cosmosCassandraPort         string
-	cosmosCassandraUser         string
-	cosmosCassandraPassword     string
+	"github.com/gocql/gocql"
+	"gopkg.in/yaml.v2"
 )
-
-var cities = []string{"New Delhi", "New York", "Bangalore", "Seattle"}
 
 const (
-	keyspace = "user_profile"
-	table    = "user"
+	configFileName = "config.yml"
 )
 
-func init() {
-	cosmosCassandraContactPoint = os.Getenv("COSMOSDB_CASSANDRA_CONTACT_POINT")
-	cosmosCassandraPort = os.Getenv("COSMOSDB_CASSANDRA_PORT")
-	cosmosCassandraUser = os.Getenv("COSMOSDB_CASSANDRA_USER")
-	cosmosCassandraPassword = os.Getenv("COSMOSDB_CASSANDRA_PASSWORD")
-
-	if cosmosCassandraContactPoint == "" || cosmosCassandraUser == "" || cosmosCassandraPassword == "" {
-		log.Fatal("missing mandatory environment variables")
-	}
+type Config struct {
+	Host     string `yaml:"Host"`
+	Port     int    `yaml:"Port"`
+	Username string `yaml:"Username"`
+	Password string `yaml:"Password"`
 }
 
 func main() {
-	session := utils.GetSession(cosmosCassandraContactPoint, cosmosCassandraPort, cosmosCassandraUser, cosmosCassandraPassword)
-	defer session.Close()
-
-	log.Println("Connected to Azure Cosmos DB")
-
-	operations.DropKeySpaceIfExists(keyspace, session)
-	operations.CreateKeySpace(keyspace, session)
-
-	operations.CreateUserTable(keyspace, table, session)
-
-	for i := 1; i <= 5; i++ {
-		name := "user-" + strconv.Itoa(i)
-		operations.InsertUser(keyspace, table, session, model.User{ID: i, Name: name, City: cities[rand.Intn(len(cities))]})
+	// Load the config from config.yml
+	config, err := loadConfig(configFileName)
+	if err != nil {
+		log.Fatalf("Failed to read config file '%s': %v", configFileName, err)
 	}
 
-	user := operations.FindUser(keyspace, table, 1, session)
-	log.Println("Found User", user)
-	time.Sleep(2 * time.Second)
-
-	users := operations.FindAllUsers(keyspace, table, session)
-	log.Println("Found Users")
-	for _, u := range users {
-		log.Println(u)
+	// Set up a connection/session to Cassandra
+	session, err := connect(config)
+	if err != nil {
+		log.Fatal("Failed to connect to DB: ", err)
 	}
+
+	// Create our keyspace/table
+	table, keyspace, err := setup.SetupTables(session)
+	if err != nil {
+		log.Fatal("Failed to setup DB: ", err)
+	}
+
+	// Set up our tasks
+	insert := inserter.Create(table, keyspace, session)
+	feed := changefeed.Create(table, keyspace, session)
+
+	// Kick off the change feed monitoring and inserting data using a helper
+	goWhenAny(
+		insert.InsertRecords,
+		feed.WatchChangeFeed,
+	)
+}
+
+// Helper function to connect to a Cassandra cluster
+func connect(config Config) (*gocql.Session, error) {
+	clusterConfig := gocql.NewCluster(config.Host)
+	clusterConfig.Port = config.Port
+	clusterConfig.ProtoVersion = 4
+	clusterConfig.Authenticator = gocql.PasswordAuthenticator{Username: config.Username, Password: config.Password}
+	clusterConfig.SslOpts = &gocql.SslOptions{Config: &tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: true}}
+	clusterConfig.ConnectTimeout = 10 * time.Second
+	clusterConfig.Timeout = 10 * time.Second
+	clusterConfig.DisableInitialHostLookup = true
+	return clusterConfig.CreateSession()
+}
+
+// Helper function to load config from a file
+func loadConfig(path string) (Config, error) {
+	var config Config
+	f, err := os.OpenFile(path, os.O_RDONLY|os.O_SYNC, 0)
+	if err != nil {
+		return config, err
+	}
+	defer f.Close()
+	err = yaml.NewDecoder(f).Decode(&config)
+	return config, err
+}
+
+// Helper function to allow you to run multiple funcs as goroutines
+//  Will return when any of them have completed
+func goWhenAny(funcs ...func() error) {
+	var wg sync.WaitGroup
+	wg.Add(1)
+	for i := 0; i < len(funcs); i++ {
+		go func(f func() error) {
+			err := f()
+			wg.Done()
+			if err != nil {
+				log.Fatalln("Error: ", err)
+			}
+		}(funcs[i])
+	}
+	wg.Wait()
 }

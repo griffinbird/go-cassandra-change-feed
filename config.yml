@@ -1,0 +1,4 @@
+Host: <cassandra contact point>
+Port: 10350
+Username: <cassandra username>
+Password: <cassandra password>
